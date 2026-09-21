@@ -46,6 +46,11 @@ func gehcSurvived(t *testing.T) bool {
 }
 
 func TestNoflushPreservesForeignChains(t *testing.T) {
+	// This models the save->restore race deterministically: the restore input is
+	// built from a snapshot that does NOT contain the foreign chain (equivalently,
+	// the host wrote it after NPC's iptables-save and before its iptables-restore).
+	// Pre-fix (flushing restore) that wipes the chain; with --noflush it survives.
+	// See TestFlushModeWipesForeignChainsBaseline for the pre-fix half.
 	// Reset the filter table to a clean slate first
 	mustRun(t, "iptables", "-F")
 	mustRun(t, "iptables", "-X")
