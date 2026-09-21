@@ -238,12 +238,23 @@ func (i *IPTablesSaveRestore) SaveInto(table string, buffer *bytes.Buffer) error
 }
 
 // Restore updates table with the content of data
+//
+// NPC calls this to reload the filter table's kube-router-owned chains.
+// --noflush is intentional: iptables-restore in its default (flushing) mode
+// wipes every chain not present in the restore input before reloading, which
+// destroys foreign chains/rules (e.g. GEHC's host firewall) whenever the input
+// was snapshotted before they were written. With --noflush, only chains named
+// in the input are touched and every other chain is left alone, so kube-router
+// is authoritative solely for the chains it lists. See
+// https://github.com/cloudnativelabs/kube-router/issues/1372
 func (i *IPTablesSaveRestore) Restore(table string, data []byte) error {
 	var args []string
 	if hasWait {
-		args = []string{"--wait", "-T", table}
+		// --noflush: don't flush the whole table; only the named chains are
+		// replaced/created/deleted (see the danwinship three-case model on #1372)
+		args = []string{"--wait", "--noflush", "-T", table}
 	} else {
-		args = []string{"-T", table}
+		args = []string{"--noflush", "-T", table}
 	}
 	return i.exec(i.restoreCmd, args, data, nil)
 }

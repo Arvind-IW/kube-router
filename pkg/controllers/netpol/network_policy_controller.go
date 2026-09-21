@@ -575,31 +575,41 @@ func (npc *NetworkPolicyController) ensureTopLevelChains() {
 func (npc *NetworkPolicyController) ensureExplicitAccept() {
 	// for the traffic to/from the local pod's let network policy controller be
 	// authoritative entity to ACCEPT the traffic if it complies to network policies
-	for ipFamily, filterTableRules := range npc.filterTableRules {
-		iptablesCmdHandler := npc.iptablesCmdHandlers[ipFamily]
+	//
+	// This rule lives in the shared builtin chains (INPUT/FORWARD/OUTPUT), which
+	// the NPC no longer rewrites through iptables-restore (now --noflush, and the
+	// builtin chains are excluded from the restore input). Applying the rule here
+	// imperatively and idempotently (AppendUnique/Insert against the live table)
+	// means NPC only ever adds its own rule and never flushes the builtin chain,
+	// so foreign rules (e.g. GEHC's GEHC-HOST-FW jump in INPUT) are preserved.
+	for _, iptablesCmdHandler := range npc.iptablesCmdHandlers {
 		for mainChain := range defaultChains {
 			comment := "\"KUBE-ROUTER rule to explicitly ACCEPT traffic that comply to network policies\""
 			args := []string{"-m", "comment", "--comment", comment, "-m", "mark", "--mark", "0x20000/0x20000",
 				"-j", "ACCEPT"}
-			exists, err := utils.Exists(filterTableRules, mainChain, args)
+			exists, err := iptablesCmdHandler.Exists("filter", mainChain, args...)
 			if err != nil {
-				utils.AppendUnique(filterTableRules, mainChain, args)
-			} else if !exists {
-				rules, err := iptablesCmdHandler.List("filter", mainChain)
-				if err != nil {
-					utils.AppendUnique(filterTableRules, mainChain, args)
-				} else {
-					newRulePos := 0
-					for pos, rule := range rules {
-						if strings.Contains(rule, "KUBE") {
-							newRulePos = pos
-						}
-					}
-					err = utils.Insert(filterTableRules, mainChain, newRulePos+1, args)
-					if err != nil {
-						utils.AppendUnique(filterTableRules, mainChain, args)
-					}
+				klog.Errorf("Failed to check for explicit accept rule in %s: %v", mainChain, err)
+				continue
+			}
+			if exists {
+				continue
+			}
+			rules, err := iptablesCmdHandler.List("filter", mainChain)
+			if err != nil {
+				klog.Errorf("Failed to list rules in %s chain: %v", mainChain, err)
+				continue
+			}
+			newRulePos := 0
+			for pos, rule := range rules {
+				if strings.Contains(rule, "KUBE") {
+					newRulePos = pos
 				}
+			}
+			// Insert after the last kube-router rule (index 0 = first rule, so a
+			// pos of X means rule X+1 is one past the last KUBE rule).
+			if err = iptablesCmdHandler.Insert("filter", mainChain, newRulePos+2, args...); err != nil {
+				klog.Errorf("Failed to insert explicit accept rule in %s: %v", mainChain, err)
 			}
 		}
 	}
@@ -727,13 +737,40 @@ func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, active
 			}
 		}
 
-		var newChains, newRules, desiredFilterTable bytes.Buffer
+		var newChains, newRules, deleteChains, desiredFilterTable bytes.Buffer
 		rules := strings.Split(npc.filterTableRules[ipFamily].String(), "\n")
 		if len(rules) > 0 && rules[len(rules)-1] == "" {
 			rules = rules[:len(rules)-1]
 		}
 		for _, rule := range rules {
 			skipRule := false
+
+			// Identify the chain a given line refers to: ":CHAINNAME" defines a
+			// chain, "-A/-I/-D CHAINNAME" is a rule in that chain, and
+			// "-X CHAINNAME" deletes it. We only want to carry lines that belong
+			// to chains kube-router is authoritative for. Everything else (foreign
+			// host chains such as GEHC's GEHC-HOST-FW, kube-proxy rules, etc.) is
+			// left out of the restore input so that --noflush leaves it alone.
+			var chainName string
+			if strings.HasPrefix(rule, ":") {
+				chainName = strings.Fields(rule[1:])[0]
+			} else if strings.HasPrefix(rule, "-X") {
+				chainName = strings.Fields(rule[2:])[0]
+			} else if strings.HasPrefix(rule, "-") {
+				fields := strings.Fields(rule)
+				if len(fields) > 1 {
+					chainName = fields[1]
+				}
+			}
+			if chainName == "" {
+				// "# ..." comments and the like; never something NPC owns.
+				continue
+			}
+
+			if !isKubeRouterManagedChain(chainName) {
+				skipRule = true
+			}
+
 			for _, podFWChainName := range cleanupPodFwChains {
 				if strings.Contains(rule, podFWChainName) {
 					skipRule = true
@@ -746,36 +783,50 @@ func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, active
 					break
 				}
 			}
-			if deleteDefaultChains {
-				for _, chain := range []string{kubeInputChainName, kubeForwardChainName, kubeOutputChainName,
-					kubeDefaultNetpolChain, kubeCommonNetpolChain} {
-					if strings.Contains(rule, chain) {
-						skipRule = true
-						break
-					}
-				}
-			}
-			if strings.Contains(rule, "COMMIT") || strings.HasPrefix(rule, "# ") {
-				skipRule = true
-			}
 			if skipRule {
 				continue
 			}
+
 			if strings.HasPrefix(rule, ":") {
 				newChains.WriteString(rule + " - [0:0]\n")
-			}
-			if strings.HasPrefix(rule, "-") {
+			} else if strings.HasPrefix(rule, "-A") || strings.HasPrefix(rule, "-I") {
 				newRules.WriteString(rule + "\n")
+			} else if strings.HasPrefix(rule, "-X") {
+				// Keep explicit -X deletions of NPC-owned chains so stale chains
+				// are actually removed under --noflush (danwinship case 2).
+				deleteChains.WriteString(rule + "\n")
 			}
 		}
+
+		// Chains we own but that are being cleaned up (stale KUBE-NWPLCY-*/KUBE-POD-FW-*
+		// or all NPC chains when deleteDefaultChains is set) must be explicitly
+		// deleted, since --noflush never flushes chains that aren't named.
+		for _, c := range append(cleanupPodFwChains, cleanupPolicyChains...) {
+			deleteChains.WriteString("-X " + c + "\n")
+		}
+
 		desiredFilterTable.WriteString("*filter" + "\n")
 		desiredFilterTable.Write(newChains.Bytes())
+		desiredFilterTable.Write(deleteChains.Bytes())
 		desiredFilterTable.Write(newRules.Bytes())
 		desiredFilterTable.WriteString("COMMIT" + "\n")
 		npc.filterTableRules[ipFamily] = &desiredFilterTable
 	}
 
 	return nil
+}
+
+// isKubeRouterManagedChain reports whether the given iptables filter-table chain
+// is owned by the NPC. Only these chains are allowed into the --noflush restore
+// input; any other chain (GEHC's GEHC-HOST-FW, kube-proxy chains, builtin chains,
+// etc.) is deliberately omitted so that iptables-restore --noflush leaves it
+// completely alone. Default (builtin) chains are excluded on purpose: NPC's rules
+// that must live in them are applied imperatively (see ensureExplicitAccept and
+// ensureTopLevelChains), never through a table-flushing restore.
+func isKubeRouterManagedChain(chain string) bool {
+	return strings.HasPrefix(chain, kubeNetworkPolicyChainPrefix) ||
+		strings.HasPrefix(chain, kubePodFirewallChainPrefix) ||
+		chain == kubeInputChainName || chain == kubeForwardChainName || chain == kubeOutputChainName
 }
 
 func (npc *NetworkPolicyController) cleanupStaleIPSets(activePolicyIPSets map[string]bool) error {

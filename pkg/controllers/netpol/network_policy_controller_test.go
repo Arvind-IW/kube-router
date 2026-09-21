@@ -979,3 +979,37 @@ func TestNetworkPolicyController(t *testing.T) {
 // Ref:
 // https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/podgc/gc_controller_test.go
 // https://github.com/kubernetes/kubernetes/blob/master/pkg/controller/testutil/test_utils.go
+
+func TestIsKubeRouterManagedChain(t *testing.T) {
+	// kube-router-owned chains belong in the --noflush restore input
+	owned := []string{
+		kubeInputChainName,
+		kubeForwardChainName,
+		kubeOutputChainName,
+		kubeDefaultNetpolChain,
+		kubeCommonNetpolChain,
+		"KUBE-NWPLCY-poc-hello",
+		"KUBE-POD-FW-poc-pod",
+	}
+	for _, c := range owned {
+		if !isKubeRouterManagedChain(c) {
+			t.Errorf("expected %q to be kube-router managed", c)
+		}
+	}
+	// anything else (GEHC host firewall, kube-proxy, builtin chains) must NOT be
+	// carried into the restore input, so --noflush leaves these chains alone
+	foreign := []string{
+		"GEHC-HOST-FW",
+		"INPUT",   // builtin chains are excluded; NPC rules there are applied imperatively
+		"FORWARD",
+		"OUTPUT",
+		"KUBE-SERVICES",
+		"KUBE-PROXY-FIREWALL",
+		"DOCKER",
+	}
+	for _, c := range foreign {
+		if isKubeRouterManagedChain(c) {
+			t.Errorf("expected %q to NOT be kube-router managed", c)
+		}
+	}
+}
