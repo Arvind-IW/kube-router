@@ -14,6 +14,7 @@ import (
 	"testing"
 
 	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
+	"github.com/coreos/go-iptables/iptables"
 	v1core "k8s.io/api/core/v1"
 )
 
@@ -133,6 +134,65 @@ func TestFlushModeWipesForeignChainsBaseline(t *testing.T) {
 	}
 	if gehcSurvived(t) {
 		t.Fatal("expected GEHC-HOST-FW to be wiped by flush-mode restore, but it survived")
+	}
+}
+
+// TestCleanupRemovesOnlyKubeRouterChains proves the Cleanup() path: NPC must be
+// able to remove itself entirely under --noflush (where omission from the
+// restore input no longer deletes anything) without touching foreign chains.
+func TestCleanupRemovesOnlyKubeRouterChains(t *testing.T) {
+	mustRun(t, "iptables", "-F")
+	mustRun(t, "iptables", "-X")
+	seedGehc(t)
+
+	npcChains := []string{
+		"KUBE-ROUTER-INPUT", "KUBE-ROUTER-FORWARD", "KUBE-ROUTER-OUTPUT",
+		"KUBE-NWPLCY-DEFAULT", "KUBE-NWPLCY-COMMON", "KUBE-POD-FW-abc123",
+	}
+	for _, c := range npcChains {
+		mustRun(t, "iptables", "-N", c)
+	}
+	// NPC's own rules in the shared builtin chains.
+	mustRun(t, "iptables", "-A", "INPUT", "-m", "comment", "--comment", "kube-router netpol - ABCDEF",
+		"-j", "KUBE-ROUTER-INPUT")
+	mustRun(t, "iptables", "-A", "FORWARD", "-m", "comment", "--comment", "kube-router netpol - GHIJKL",
+		"-j", "KUBE-ROUTER-FORWARD")
+	mustRun(t, "iptables", "-A", "OUTPUT", "-m", "comment", "--comment", "kube-router netpol - MNOPQR",
+		"-j", "KUBE-ROUTER-OUTPUT")
+	mustRun(t, "iptables", "-A", "FORWARD", "-m", "comment", "--comment",
+		"KUBE-ROUTER rule to explicitly ACCEPT traffic that comply to network policies",
+		"-m", "mark", "--mark", "0x20000/0x20000", "-j", "ACCEPT")
+	// A foreign rule in a builtin chain that must be left alone.
+	mustRun(t, "iptables", "-A", "INPUT", "-p", "tcp", "--dport", "9999", "-j", "ACCEPT")
+	// Cross-references between NPC chains: these keep the chains from being
+	// deletable until they are flushed first.
+	mustRun(t, "iptables", "-A", "KUBE-NWPLCY-DEFAULT", "-j", "KUBE-NWPLCY-COMMON")
+	mustRun(t, "iptables", "-A", "KUBE-ROUTER-FORWARD", "-j", "KUBE-POD-FW-abc123")
+
+	handler, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	if err != nil {
+		t.Fatalf("iptables handler: %v", err)
+	}
+	npc := &NetworkPolicyController{
+		iptablesCmdHandlers: map[v1core.IPFamily]utils.IPTablesHandler{v1core.IPv4Protocol: handler},
+	}
+	npc.deleteKubeRouterFilterChains()
+
+	save := mustRun(t, "iptables-save")
+	for _, c := range npcChains {
+		if bytes.Contains([]byte(save), []byte(":"+c+" ")) {
+			t.Errorf("kube-router chain %s survived cleanup", c)
+		}
+	}
+	if bytes.Contains([]byte(save), []byte("kube-router netpol")) ||
+		bytes.Contains([]byte(save), []byte("explicitly ACCEPT traffic")) {
+		t.Error("kube-router rules survived in the builtin chains")
+	}
+	if !bytes.Contains([]byte(save), []byte("--dport 9999")) {
+		t.Error("foreign rule in INPUT was removed by cleanup")
+	}
+	if !gehcSurvived(t) {
+		t.Error("foreign GEHC chain was removed by cleanup")
 	}
 }
 

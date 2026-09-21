@@ -309,7 +309,7 @@ func (npc *NetworkPolicyController) fullPolicySync() {
 	// top level chains
 	npc.ensureExplicitAccept()
 
-	err = npc.cleanupStaleRules(activePolicyChains, activePodFwChains, false)
+	err = npc.cleanupStaleRules(activePolicyChains, activePodFwChains)
 	if err != nil {
 		klog.Errorf("Aborting sync. Failed to cleanup stale iptables rules: %v", err.Error())
 		return
@@ -704,8 +704,7 @@ func (npc *NetworkPolicyController) ensureDefaultNetworkPolicyChain() {
 	}
 }
 
-func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, activePodFwChains map[string]bool,
-	deleteDefaultChains bool) error {
+func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, activePodFwChains map[string]bool) error {
 
 	cleanupPodFwChains := make([]string, 0)
 	cleanupPolicyChains := make([]string, 0)
@@ -798,9 +797,9 @@ func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, active
 			}
 		}
 
-		// Chains we own but that are being cleaned up (stale KUBE-NWPLCY-*/KUBE-POD-FW-*
-		// or all NPC chains when deleteDefaultChains is set) must be explicitly
-		// deleted, since --noflush never flushes chains that aren't named.
+		// Chains we own but that are being cleaned up (stale
+		// KUBE-NWPLCY-*/KUBE-POD-FW-*) must be explicitly deleted, since
+		// --noflush never flushes chains that aren't named.
 		for _, c := range append(cleanupPodFwChains, cleanupPolicyChains...) {
 			deleteChains.WriteString("-X " + c + "\n")
 		}
@@ -866,6 +865,82 @@ func (npc *NetworkPolicyController) cleanupStaleIPSets(activePolicyIPSets map[st
 	return nil
 }
 
+// builtinChainRuleComments are the comment markers NPC puts on the rules it
+// adds to the shared builtin chains (INPUT/FORWARD/OUTPUT): the jump to the NPC
+// top-level chain, and the explicit-ACCEPT rule. They identify NPC's own rules
+// so they can be removed without disturbing anyone else's.
+var builtinChainRuleComments = []string{
+	"kube-router netpol",
+	"KUBE-ROUTER rule to explicitly ACCEPT traffic that comply to network policies",
+}
+
+// deleteKubeRouterFilterChains removes every trace of NPC from the filter table.
+//
+// NPC no longer rewrites the shared builtin chains through a flushing
+// iptables-restore, so it cannot rely on a table flush to remove itself. It must
+// instead: (1) delete its own rules from the builtin chains, so nothing
+// references the NPC chains any more, and only then (2) flush and delete the
+// NPC-owned chains. Foreign chains (e.g. GEHC's host firewall) are never touched.
+func (npc *NetworkPolicyController) deleteKubeRouterFilterChains() {
+	for _, handler := range npc.iptablesCmdHandlers {
+		// (1) Drop NPC's own rules from the builtin chains. Delete from the
+		// highest rule number down so the remaining numbers stay valid.
+		for builtinChain := range defaultChains {
+			rules, err := handler.List("filter", builtinChain)
+			if err != nil {
+				klog.Errorf("failed to list rules in builtin chain %s during cleanup: %v", builtinChain, err)
+				continue
+			}
+			// List() returns the chain policy (and chain headers) first, which
+			// are not rules and shift the rule numbering.
+			var ruleNumbers []int
+			offset := 0
+			for i, rule := range rules {
+				if strings.HasPrefix(rule, "-P") || strings.HasPrefix(rule, "-N") {
+					offset++
+					continue
+				}
+				for _, comment := range builtinChainRuleComments {
+					if strings.Contains(rule, comment) {
+						ruleNumbers = append(ruleNumbers, i+1-offset)
+						break
+					}
+				}
+			}
+			for i := len(ruleNumbers) - 1; i >= 0; i-- {
+				if err := handler.Delete("filter", builtinChain, strconv.Itoa(ruleNumbers[i])); err != nil {
+					klog.Errorf("failed to delete kube-router rule %d from builtin chain %s during cleanup: %v",
+						ruleNumbers[i], builtinChain, err)
+				}
+			}
+		}
+
+		// (2) Flush every NPC-owned chain first, so cross-chain references
+		// between them are gone, then delete them.
+		chains, err := handler.ListChains("filter")
+		if err != nil {
+			klog.Errorf("failed to list chains during cleanup: %v", err)
+			continue
+		}
+		var owned []string
+		for _, chain := range chains {
+			if isKubeRouterManagedChain(chain) {
+				owned = append(owned, chain)
+			}
+		}
+		for _, chain := range owned {
+			if err := handler.ClearChain("filter", chain); err != nil {
+				klog.Errorf("failed to flush kube-router chain %s during cleanup: %v", chain, err)
+			}
+		}
+		for _, chain := range owned {
+			if err := handler.DeleteChain("filter", chain); err != nil {
+				klog.Errorf("failed to delete kube-router chain %s during cleanup: %v", chain, err)
+			}
+		}
+	}
+}
+
 // Cleanup cleanup configurations done
 func (npc *NetworkPolicyController) Cleanup() {
 	klog.Info("Cleaning up NetworkPolicyController configurations...")
@@ -891,32 +966,16 @@ func (npc *NetworkPolicyController) Cleanup() {
 	}
 
 	var emptySet map[string]bool
-	// Take a dump (iptables-save) of the current filter table for cleanupStaleRules() to work on
-	for ipFamily, iptablesSaveRestore := range npc.iptablesSaveRestore {
-		if err := iptablesSaveRestore.SaveInto("filter", npc.filterTableRules[ipFamily]); err != nil {
-			klog.Errorf("error encountered attempting to list iptables rules for cleanup: %v", err)
-			return
-		}
-	}
-	// Run cleanupStaleRules() to get rid of most of the kube-router rules (this is the same logic that runs as
-	// part NPC's runtime loop). Setting the last parameter to true causes even the default chains are removed.
-	err := npc.cleanupStaleRules(emptySet, emptySet, true)
-	if err != nil {
-		klog.Errorf("error encountered attempting to cleanup iptables rules: %v", err)
-		return
-	}
-	// Restore (iptables-restore) npc's cleaned up version of the iptables filter chain
-	for ipFamily, iptablesSaveRestore := range npc.iptablesSaveRestore {
-		if err = iptablesSaveRestore.Restore("filter", npc.filterTableRules[ipFamily].Bytes()); err != nil {
-			klog.Errorf(
-				"error encountered while loading running iptables-restore: %v\n%s", err,
-				npc.filterTableRules[ipFamily].String())
-		}
-	}
+	// Remove NPC's configuration imperatively. Under --noflush the restore only
+	// touches the chains named in its input, so cleanup cannot be expressed as a
+	// restore that simply omits kube-router's chains: they must be deleted.
+	// deleteKubeRouterFilterChains() drops NPC's rules from the builtin chains
+	// and then flushes and deletes the NPC-owned chains, leaving foreign chains
+	// (e.g. GEHC's host firewall) untouched.
+	npc.deleteKubeRouterFilterChains()
 
 	// Cleanup ipsets
-	err = npc.cleanupStaleIPSets(emptySet)
-	if err != nil {
+	if err := npc.cleanupStaleIPSets(emptySet); err != nil {
 		klog.Errorf("error encountered while cleaning ipsets: %v", err)
 		return
 	}
