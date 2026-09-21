@@ -55,7 +55,11 @@ func TestNoflushPreservesForeignChains(t *testing.T) {
 	}
 
 	restore := utils.NewIPTablesSaveRestore(v1core.IPv4Protocol)
-	for i := 0; i < 20; i++ {
+	// Create an NPC-owned chain so each cycle's input actually carries NPC
+	// content alongside the foreign chains that must be left alone.
+	mustRun(t, "iptables", "-N", "KUBE-ROUTER-INPUT")
+	mustRun(t, "iptables", "-A", "KUBE-ROUTER-INPUT", "-j", "RETURN")
+	for i := range 20 {
 		// Build the restore input the way NPC's sync does: snapshot the table,
 		// then keep ONLY kube-router-owned chains (foreign chains dropped from
 		// the input so --noflush leaves them alone).
@@ -63,11 +67,7 @@ func TestNoflushPreservesForeignChains(t *testing.T) {
 		if err := restore.SaveInto("filter", &buf); err != nil {
 			t.Fatalf("SaveInto: %v", err)
 		}
-		desired := filterToManagedChains(&buf)
-		// include a kube-router chain so NPC's "own" content is present each cycle
-		if i == 0 {
-			mustRun(t, "iptables", "-N", "KUBE-ROUTER-INPUT")
-		}
+		desired := bytes.NewBuffer(buildNoflushRestoreInput(buf.String(), nil, nil))
 		if err := restore.Restore("filter", desired.Bytes()); err != nil {
 			t.Fatalf("Restore cycle %d: %v", i, err)
 		}
@@ -78,35 +78,10 @@ func TestNoflushPreservesForeignChains(t *testing.T) {
 	if !gehcSurvived(t) {
 		t.Fatal("GEHC-HOST-FW permanently lost")
 	}
-}
-
-// filterToManagedChains keeps only NPC-owned chain defs/rules from a full
-// iptables-save buffer, mirroring the fix's cleanupStaleRules behavior.
-func filterToManagedChains(src *bytes.Buffer) *bytes.Buffer {
-	out := &bytes.Buffer{}
-	out.WriteString("*filter\n")
-	for _, rule := range bytes.Split(src.Bytes(), []byte("\n")) {
-		var chain string
-		switch {
-		case bytes.HasPrefix(rule, []byte(":")):
-			chain = string(bytes.Fields(rule[1:])[0])
-		case bytes.HasPrefix(rule, []byte("-A")), bytes.HasPrefix(rule, []byte("-I")):
-			f := bytes.Fields(rule)
-			if len(f) > 1 {
-				chain = string(f[1])
-			}
-		}
-		if chain == "" || !isKubeRouterManagedChain(chain) {
-			continue
-		}
-		if bytes.HasPrefix(rule, []byte(":")) {
-			out.Write(append(rule, []byte(" - [0:0]\n")...))
-		} else {
-			out.Write(append(rule, '\n'))
-		}
+	// NPC's own chain must still be managed (and thus present) after the cycles.
+	if !bytes.Contains([]byte(mustRun(t, "iptables-save")), []byte(":KUBE-ROUTER-INPUT")) {
+		t.Error("kube-router's own chain was lost across cycles")
 	}
-	out.WriteString("COMMIT\n")
-	return out
 }
 
 // TestFlushModeWipesForeignChainsBaseline demonstrates the pre-fix bug: a
@@ -126,7 +101,7 @@ func TestFlushModeWipesForeignChainsBaseline(t *testing.T) {
 	if err := utils.NewIPTablesSaveRestore(v1core.IPv4Protocol).SaveInto("filter", &buf); err != nil {
 		t.Fatalf("SaveInto: %v", err)
 	}
-	desired := filterToManagedChains(&buf)
+	desired := bytes.NewBuffer(buildNoflushRestoreInput(buf.String(), nil, nil))
 	cmd := exec.Command("iptables-restore", "-T", "filter")
 	cmd.Stdin = desired
 	if out, err := cmd.CombinedOutput(); err != nil {

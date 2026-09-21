@@ -1000,7 +1000,7 @@ func TestIsKubeRouterManagedChain(t *testing.T) {
 	// carried into the restore input, so --noflush leaves these chains alone
 	foreign := []string{
 		"GEHC-HOST-FW",
-		"INPUT",   // builtin chains are excluded; NPC rules there are applied imperatively
+		"INPUT", // builtin chains are excluded; NPC rules there are applied imperatively
 		"FORWARD",
 		"OUTPUT",
 		"KUBE-SERVICES",

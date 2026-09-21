@@ -736,83 +736,95 @@ func (npc *NetworkPolicyController) cleanupStaleRules(activePolicyChains, active
 			}
 		}
 
-		var newChains, newRules, deleteChains, desiredFilterTable bytes.Buffer
-		rules := strings.Split(npc.filterTableRules[ipFamily].String(), "\n")
-		if len(rules) > 0 && rules[len(rules)-1] == "" {
-			rules = rules[:len(rules)-1]
-		}
-		for _, rule := range rules {
-			skipRule := false
-
-			// Identify the chain a given line refers to: ":CHAINNAME" defines a
-			// chain, "-A/-I/-D CHAINNAME" is a rule in that chain, and
-			// "-X CHAINNAME" deletes it. We only want to carry lines that belong
-			// to chains kube-router is authoritative for. Everything else (foreign
-			// host chains such as GEHC's GEHC-HOST-FW, kube-proxy rules, etc.) is
-			// left out of the restore input so that --noflush leaves it alone.
-			var chainName string
-			if strings.HasPrefix(rule, ":") {
-				chainName = strings.Fields(rule[1:])[0]
-			} else if strings.HasPrefix(rule, "-X") {
-				chainName = strings.Fields(rule[2:])[0]
-			} else if strings.HasPrefix(rule, "-") {
-				fields := strings.Fields(rule)
-				if len(fields) > 1 {
-					chainName = fields[1]
-				}
-			}
-			if chainName == "" {
-				// "# ..." comments and the like; never something NPC owns.
-				continue
-			}
-
-			if !isKubeRouterManagedChain(chainName) {
-				skipRule = true
-			}
-
-			for _, podFWChainName := range cleanupPodFwChains {
-				if strings.Contains(rule, podFWChainName) {
-					skipRule = true
-					break
-				}
-			}
-			for _, policyChainName := range cleanupPolicyChains {
-				if strings.Contains(rule, policyChainName) {
-					skipRule = true
-					break
-				}
-			}
-			if skipRule {
-				continue
-			}
-
-			if strings.HasPrefix(rule, ":") {
-				newChains.WriteString(rule + " - [0:0]\n")
-			} else if strings.HasPrefix(rule, "-A") || strings.HasPrefix(rule, "-I") {
-				newRules.WriteString(rule + "\n")
-			} else if strings.HasPrefix(rule, "-X") {
-				// Keep explicit -X deletions of NPC-owned chains so stale chains
-				// are actually removed under --noflush (danwinship case 2).
-				deleteChains.WriteString(rule + "\n")
-			}
-		}
-
-		// Chains we own but that are being cleaned up (stale
-		// KUBE-NWPLCY-*/KUBE-POD-FW-*) must be explicitly deleted, since
-		// --noflush never flushes chains that aren't named.
-		for _, c := range append(cleanupPodFwChains, cleanupPolicyChains...) {
-			deleteChains.WriteString("-X " + c + "\n")
-		}
-
-		desiredFilterTable.WriteString("*filter" + "\n")
-		desiredFilterTable.Write(newChains.Bytes())
-		desiredFilterTable.Write(deleteChains.Bytes())
-		desiredFilterTable.Write(newRules.Bytes())
-		desiredFilterTable.WriteString("COMMIT" + "\n")
-		npc.filterTableRules[ipFamily] = &desiredFilterTable
+		npc.filterTableRules[ipFamily] = bytes.NewBuffer(
+			buildNoflushRestoreInput(npc.filterTableRules[ipFamily].String(), cleanupPolicyChains, cleanupPodFwChains))
 	}
 
 	return nil
+}
+
+// buildNoflushRestoreInput turns a full filter-table snapshot (the format
+// produced by iptables-save) into the input NPC feeds to iptables-restore
+// --noflush.
+//
+// Only chains kube-router is authoritative for are carried over. Everything else
+// — foreign host chains such as GEHC's GEHC-HOST-FW, kube-proxy chains, the
+// shared builtin chains — is deliberately omitted, so that --noflush leaves it
+// exactly as it is. Chains listed in cleanupPolicyChains/cleanupPodFwChains are
+// additionally excluded and emitted as explicit "-X" deletions, since --noflush
+// never flushes a chain that isn't named.
+func buildNoflushRestoreInput(snapshot string, cleanupPolicyChains, cleanupPodFwChains []string) []byte {
+	var newChains, newRules, deleteChains, desiredFilterTable bytes.Buffer
+	rules := strings.Split(snapshot, "\n")
+	if len(rules) > 0 && rules[len(rules)-1] == "" {
+		rules = rules[:len(rules)-1]
+	}
+	for _, rule := range rules {
+		skipRule := false
+
+		// Identify the chain a given line refers to: ":CHAINNAME" defines a
+		// chain, "-A/-I/-D CHAINNAME" is a rule in that chain, and
+		// "-X CHAINNAME" deletes it.
+		var chainName string
+		if strings.HasPrefix(rule, ":") {
+			chainName = strings.Fields(rule[1:])[0]
+		} else if strings.HasPrefix(rule, "-X") {
+			chainName = strings.Fields(rule[2:])[0]
+		} else if strings.HasPrefix(rule, "-") {
+			fields := strings.Fields(rule)
+			if len(fields) > 1 {
+				chainName = fields[1]
+			}
+		}
+		if chainName == "" {
+			// "# ..." comments and the like; never something NPC owns.
+			continue
+		}
+
+		if !isKubeRouterManagedChain(chainName) {
+			skipRule = true
+		}
+
+		for _, podFWChainName := range cleanupPodFwChains {
+			if strings.Contains(rule, podFWChainName) {
+				skipRule = true
+				break
+			}
+		}
+		for _, policyChainName := range cleanupPolicyChains {
+			if strings.Contains(rule, policyChainName) {
+				skipRule = true
+				break
+			}
+		}
+		if skipRule {
+			continue
+		}
+
+		if strings.HasPrefix(rule, ":") {
+			newChains.WriteString(rule + " - [0:0]\n")
+		} else if strings.HasPrefix(rule, "-A") || strings.HasPrefix(rule, "-I") {
+			newRules.WriteString(rule + "\n")
+		} else if strings.HasPrefix(rule, "-X") {
+			// Keep explicit -X deletions of NPC-owned chains so stale chains
+			// are actually removed under --noflush (danwinship case 3).
+			deleteChains.WriteString(rule + "\n")
+		}
+	}
+
+	// Chains we own but that are being cleaned up (stale
+	// KUBE-NWPLCY-*/KUBE-POD-FW-*) must be explicitly deleted, since
+	// --noflush never flushes chains that aren't named.
+	for _, c := range append(cleanupPodFwChains, cleanupPolicyChains...) {
+		deleteChains.WriteString("-X " + c + "\n")
+	}
+
+	desiredFilterTable.WriteString("*filter" + "\n")
+	desiredFilterTable.Write(newChains.Bytes())
+	desiredFilterTable.Write(deleteChains.Bytes())
+	desiredFilterTable.Write(newRules.Bytes())
+	desiredFilterTable.WriteString("COMMIT" + "\n")
+	return desiredFilterTable.Bytes()
 }
 
 // isKubeRouterManagedChain reports whether the given iptables filter-table chain
