@@ -606,9 +606,11 @@ func (npc *NetworkPolicyController) ensureExplicitAccept() {
 					newRulePos = pos
 				}
 			}
-			// Insert after the last kube-router rule (index 0 = first rule, so a
-			// pos of X means rule X+1 is one past the last KUBE rule).
-			if err = iptablesCmdHandler.Insert("filter", mainChain, newRulePos+2, args...); err != nil {
+			// Insert after the last kube-router rule. List() returns the chain
+			// header at index 0, so index k is 1-based position k and the slot
+			// after it is k+1 (k+2 overruns the chain when the last KUBE rule is
+			// the final rule, which fails with "Index of insertion too big").
+			if err = iptablesCmdHandler.Insert("filter", mainChain, newRulePos+1, args...); err != nil {
 				klog.Errorf("Failed to insert explicit accept rule in %s: %v", mainChain, err)
 			}
 		}
@@ -813,16 +815,22 @@ func buildNoflushRestoreInput(snapshot string, cleanupPolicyChains, cleanupPodFw
 	}
 
 	// Chains we own but that are being cleaned up (stale
-	// KUBE-NWPLCY-*/KUBE-POD-FW-*) must be explicitly deleted, since
-	// --noflush never flushes chains that aren't named.
+	// KUBE-NWPLCY-*/KUBE-POD-FW-*) must be explicitly deleted, since --noflush
+	// never flushes chains that aren't named. -F must precede -X: iptables
+	// refuses to delete a non-empty chain ("CHAIN_USER_DEL failed ... Device or
+	// resource busy"), and their rules were deliberately excluded above.
 	for _, c := range append(cleanupPodFwChains, cleanupPolicyChains...) {
+		deleteChains.WriteString("-F " + c + "\n")
 		deleteChains.WriteString("-X " + c + "\n")
 	}
 
+	// Deletions go after the rules: a stale chain can still be referenced by a
+	// rule the restore is about to rewrite, and -X fails while any reference
+	// remains.
 	desiredFilterTable.WriteString("*filter" + "\n")
 	desiredFilterTable.Write(newChains.Bytes())
-	desiredFilterTable.Write(deleteChains.Bytes())
 	desiredFilterTable.Write(newRules.Bytes())
+	desiredFilterTable.Write(deleteChains.Bytes())
 	desiredFilterTable.WriteString("COMMIT" + "\n")
 	return desiredFilterTable.Bytes()
 }

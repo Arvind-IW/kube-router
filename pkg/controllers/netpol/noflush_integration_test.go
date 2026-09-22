@@ -11,6 +11,7 @@ import (
 	"bytes"
 	"os"
 	"os/exec"
+	"strings"
 	"testing"
 
 	"github.com/cloudnativelabs/kube-router/v2/pkg/utils"
@@ -173,6 +174,102 @@ func TestCleanupRemovesOnlyKubeRouterChains(t *testing.T) {
 	}
 	if !gehcSurvived(t) {
 		t.Error("foreign GEHC chain was removed by cleanup")
+	}
+}
+
+// TestCleanupRemovesPopulatedStaleChains covers cleanupStaleRules' path through
+// buildNoflushRestoreInput: a stale KUBE-NWPLCY-*/KUBE-POD-FW-* chain in a live
+// cluster is both POPULATED (NPC filled it with rules) and REFERENCED by another
+// NPC chain. iptables refuses to delete a non-empty chain ("CHAIN_USER_DEL
+// failed ... Device or resource busy"), and refuses while a reference remains, so
+// a bare "-X" aborts the entire restore and breaks the sync.
+func TestCleanupRemovesPopulatedStaleChains(t *testing.T) {
+	mustRun(t, "iptables", "-F")
+	mustRun(t, "iptables", "-X")
+	seedGehc(t)
+
+	mustRun(t, "iptables", "-N", "KUBE-ROUTER-FORWARD")
+	mustRun(t, "iptables", "-N", "KUBE-NWPLCY-STALE")
+	mustRun(t, "iptables", "-A", "KUBE-NWPLCY-STALE", "-j", "RETURN")
+	mustRun(t, "iptables", "-A", "KUBE-ROUTER-FORWARD", "-j", "KUBE-NWPLCY-STALE")
+
+	restore := utils.NewIPTablesSaveRestore(v1core.IPv4Protocol)
+	var buf bytes.Buffer
+	if err := restore.SaveInto("filter", &buf); err != nil {
+		t.Fatalf("SaveInto: %v", err)
+	}
+	desired := buildNoflushRestoreInput(buf.String(), []string{"KUBE-NWPLCY-STALE"}, nil)
+	if err := restore.Restore("filter", desired); err != nil {
+		t.Fatalf("restore with a populated, referenced stale chain failed: %v", err)
+	}
+
+	save := mustRun(t, "iptables-save")
+	if bytes.Contains([]byte(save), []byte(":KUBE-NWPLCY-STALE ")) {
+		t.Error("stale chain survived cleanup")
+	}
+	if bytes.Contains([]byte(save), []byte("-j KUBE-NWPLCY-STALE")) {
+		t.Error("reference to the stale chain survived, so it could never be deleted")
+	}
+	if !bytes.Contains([]byte(save), []byte(":KUBE-ROUTER-FORWARD ")) {
+		t.Error("kube-router's own live chain was removed")
+	}
+	if !gehcSurvived(t) {
+		t.Error("foreign GEHC chain was removed")
+	}
+}
+
+// TestExplicitAcceptRuleInsertedIntoBuiltinChains covers ensureExplicitAccept's
+// imperative placement. iptables.List() returns the chain header at index 0, so
+// the slot after the rule at index k is k+1; inserting at k+2 overruns the chain
+// whenever the last kube-router rule is also the last rule, so the ACCEPT rule
+// was never installed and netpol enforcement silently degraded.
+func TestExplicitAcceptRuleInsertedIntoBuiltinChains(t *testing.T) {
+	mustRun(t, "iptables", "-F")
+	mustRun(t, "iptables", "-X")
+	// A foreign rule first, then kube-router's rule LAST, so the last KUBE rule
+	// is the final rule of the chain.
+	mustRun(t, "iptables", "-A", "INPUT", "-p", "tcp", "--dport", "1234", "-j", "ACCEPT")
+	mustRun(t, "iptables", "-A", "INPUT", "-m", "comment", "--comment", "kube-router netpol - ABCDEF",
+		"-j", "RETURN")
+	mustRun(t, "iptables", "-A", "FORWARD", "-m", "comment", "--comment", "kube-router netpol - GHIJKL",
+		"-j", "RETURN")
+
+	handler, err := iptables.NewWithProtocol(iptables.ProtocolIPv4)
+	if err != nil {
+		t.Fatalf("iptables handler: %v", err)
+	}
+	npc := &NetworkPolicyController{
+		iptablesCmdHandlers: map[v1core.IPFamily]utils.IPTablesHandler{v1core.IPv4Protocol: handler},
+	}
+	npc.ensureExplicitAccept()
+
+	for _, chain := range []string{"INPUT", "FORWARD", "OUTPUT"} {
+		rules, err := handler.List("filter", chain)
+		if err != nil {
+			t.Fatalf("list %s: %v", chain, err)
+		}
+		acceptIdx, lastKubeIdx := -1, -1
+		for i, r := range rules {
+			if strings.Contains(r, "0x20000/0x20000") {
+				acceptIdx = i
+			}
+			if strings.Contains(r, "KUBE") {
+				lastKubeIdx = i
+			}
+		}
+		if acceptIdx == -1 {
+			t.Errorf("explicit accept rule missing from %s", chain)
+			continue
+		}
+		// The foreign rule must not have been displaced, and the ACCEPT rule must
+		// land after kube-router's own rules when the chain has any.
+		if lastKubeIdx != -1 && acceptIdx < lastKubeIdx {
+			t.Errorf("%s: accept rule at %d precedes kube-router rule at %d", chain, acceptIdx, lastKubeIdx)
+		}
+	}
+
+	if save := mustRun(t, "iptables-save"); !bytes.Contains([]byte(save), []byte("--dport 1234")) {
+		t.Error("foreign rule in INPUT was displaced")
 	}
 }
 
